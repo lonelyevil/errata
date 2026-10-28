@@ -162,7 +162,7 @@ docker buildx build --platform linux/amd64 --load --tag errata:local .
 - 不存在：先构建并冒烟检查 `linux/amd64` 与 `linux/arm64`，通过后发布 `X.Y.Z` 和 `latest`。
 - 手动触发默认只验证；显式设置 `push=true` 才发布。
 
-构建上下文来自上游 tag 的实际源码，不把当前分支代码冒充上游版本。为保证容器打包可重复，工作流会从当前仓库覆盖 `Dockerfile`、`.dockerignore`、`package.json` 和 `vite.config.ts`，随后把 `package.json` 的 `version` 写回上游 tag 版本。若未来上游依赖或构建方式变化导致这些兼容文件不再适用，工作流会失败，需要同步更新打包配置，而不是静默发布错误镜像。
+构建上下文来自上游 tag 的实际源码，不把当前分支代码冒充上游版本。为保证容器打包可重复，工作流会从当前仓库覆盖 `Dockerfile`、`.dockerignore`、`package.json` 和 `vite.config.ts`，同步 `patches/`（上游没有该目录时先创建空目录），随后把 `package.json` 的 `version` 写回上游 tag 版本。若未来上游依赖或构建方式变化导致这些兼容文件不再适用，工作流会失败，需要同步更新打包配置，而不是静默发布错误镜像。
 
 发布 job 使用最小权限：
 
