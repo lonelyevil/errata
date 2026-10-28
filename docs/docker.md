@@ -8,6 +8,7 @@
 - `Dockerfile`：多阶段、跨架构构建；最终镜像使用非 root 用户运行。
 - `compose.yaml`：本地构建与启动，使用命名卷保存数据。
 - `.github/workflows/docker.yml`：测试、双架构镜像冒烟检查，以及 GHCR 发布。
+- `.github/workflows/upstream-docker.yml`：检查上游最新稳定 tag，并为 GHCR 中缺失的版本构建 `<版本号>` 与 `latest` 镜像。
 - `package.json`：将直接依赖的 TanStack 包固定到仓库原声明版本（Router/Start `1.132.0`、SSR Query `1.131.7`），避免新版 Start 与 Vite 7 的 peer 版本不兼容。
 - `vite.config.ts`：按 TanStack Start 与 Nitro 的集成顺序排列插件。
 - `src/routeTree.gen.ts`：由固定版本的路由生成器重新生成类型声明。
@@ -140,7 +141,7 @@ docker buildx build --platform linux/amd64 --load --tag errata:local .
 
 ## GitHub Actions 与 GHCR
 
-工作流：`.github/workflows/docker.yml`。
+工作流：`.github/workflows/docker.yml` 与 `.github/workflows/upstream-docker.yml`。
 
 ### 触发与发布规则
 
@@ -152,6 +153,16 @@ docker buildx build --platform linux/amd64 --load --tag errata:local .
 | 手动 `workflow_dispatch` | 同上 | 默认否；显式设置 `push=true` 时推送 SHA 标签 |
 
 正式 Release `v1.12.0` 会生成 `1.12.0`、`1.12`、`1`、`latest` 和 SHA 标签。预发布不更新 `latest`。
+
+### 上游稳定版本补建
+
+`.github/workflows/upstream-docker.yml` 每天 02:23 UTC 以及每次 push/merge 到 `main`/`master` 时运行，也可手动触发。它通过 `git ls-remote` 获取 `tealios/errata` 的最新稳定 `vX.Y.Z` tag，并检查当前 GHCR 是否已有对应的 `X.Y.Z` 镜像：
+
+- 已存在：跳过构建。
+- 不存在：先构建并冒烟检查 `linux/amd64` 与 `linux/arm64`，通过后发布 `X.Y.Z` 和 `latest`。
+- 手动触发默认只验证；显式设置 `push=true` 才发布。
+
+构建上下文来自上游 tag 的实际源码，不把当前分支代码冒充上游版本。为保证容器打包可重复，工作流会从当前仓库覆盖 `Dockerfile`、`.dockerignore`、`package.json` 和 `vite.config.ts`，随后把 `package.json` 的 `version` 写回上游 tag 版本。若未来上游依赖或构建方式变化导致这些兼容文件不再适用，工作流会失败，需要同步更新打包配置，而不是静默发布错误镜像。
 
 发布 job 使用最小权限：
 
@@ -224,6 +235,7 @@ docker buildx imagetools inspect ghcr.io/lonelyevil/errata:latest
 - `docker compose config --quiet` 与 workflow YAML 静态解析：通过。
 - ARM64 镜像构建及健康、架构、非 root 用户和持久化检查：通过。
 - AMD64 镜像构建：完成；受本地环境限制，容器运行检查未完成，不计为通过项。
+- 上游补建 workflow：YAML、job 依赖与嵌入 shell 静态检查通过；实际上游检测和构建由 GitHub Actions 执行。
 - GHCR 实际推送与多架构 manifest：未在本地执行，由首次 GitHub Actions 发布验证。
 
 ## 官方资料

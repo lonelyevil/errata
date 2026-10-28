@@ -1,0 +1,262 @@
+name: Upstream Docker release
+
+on:
+  schedule:
+    - cron: '23 2 * * *'
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      push:
+        description: Push a missing upstream release to GHCR after verification
+        required: true
+        default: false
+        type: boolean
+
+concurrency:
+  group: docker-upstream-release
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  UPSTREAM_REPOSITORY: tealios/errata
+
+jobs:
+  upstream-check:
+    name: Find missing upstream release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+      exists: ${{ steps.release.outputs.exists }}
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve latest stable upstream tag and check GHCR
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tag="$(
+            git ls-remote --tags --refs https://github.com/${UPSTREAM_REPOSITORY}.git 'v*' |
+              awk -F/ '{print $3}' |
+              grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' |
+              sort -V |
+              tail -n 1
+          )"
+          if [[ -z "${tag}" ]]; then
+            echo "No stable version tags found in ${UPSTREAM_REPOSITORY}" >&2
+            exit 1
+          fi
+
+          version="${tag#v}"
+          image="${REGISTRY}/${IMAGE_NAME}:${version}"
+          echo "Latest upstream tag: ${tag}"
+
+          if docker buildx imagetools inspect "${image}" >/dev/null 2>&1; then
+            echo "Image already exists: ${image}"
+            exists=true
+          else
+            echo "Image is missing: ${image}"
+            exists=false
+          fi
+
+          {
+            echo "tag=${tag}"
+            echo "version=${version}"
+            echo "exists=${exists}"
+          } >> "${GITHUB_OUTPUT}"
+
+  upstream-smoke:
+    name: Upstream image smoke (${{ matrix.platform }})
+    needs: upstream-check
+    if: needs.upstream-check.outputs.exists == 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            slug: amd64
+            port: 17741
+          - platform: linux/arm64
+            slug: arm64
+            port: 17742
+    steps:
+      - name: Checkout packaging files
+        uses: actions/checkout@v6
+        with:
+          path: packaging
+
+      - name: Checkout upstream release
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.UPSTREAM_REPOSITORY }}
+          ref: ${{ needs.upstream-check.outputs.tag }}
+          fetch-depth: 1
+          path: upstream
+
+      - name: Apply Docker packaging and build compatibility files
+        env:
+          UPSTREAM_VERSION: ${{ needs.upstream-check.outputs.version }}
+        run: |
+          set -euo pipefail
+          cp packaging/Dockerfile packaging/.dockerignore packaging/package.json packaging/vite.config.ts upstream/
+          node -e "const fs = require('fs'); const path = 'upstream/package.json'; const pkg = JSON.parse(fs.readFileSync(path)); pkg.version = process.env.UPSTREAM_VERSION; fs.writeFileSync(path, JSON.stringify(pkg, null, 2) + '\n')"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build upstream image for smoke test
+        uses: docker/build-push-action@v7
+        with:
+          context: upstream
+          platforms: ${{ matrix.platform }}
+          load: true
+          tags: errata:upstream-${{ matrix.slug }}
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=errata-upstream-${{ matrix.slug }}
+          cache-to: type=gha,scope=errata-upstream-${{ matrix.slug }},mode=max
+
+      - name: Run upstream health, persistence, and architecture checks
+        env:
+          IMAGE: errata:upstream-${{ matrix.slug }}
+          CONTAINER: errata-upstream-${{ matrix.slug }}
+          PORT: ${{ matrix.port }}
+          EXPECTED_PLATFORM: ${{ matrix.platform }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          docker run --detach \
+            --name "${CONTAINER}" \
+            --publish "127.0.0.1:${PORT}:7739" \
+            --volume "${CONTAINER}-data:/data" \
+            "${IMAGE}"
+
+          wait_for_health() {
+            for attempt in $(seq 1 60); do
+              if curl --fail --silent --show-error "http://127.0.0.1:${PORT}/api/health"; then
+                return 0
+              fi
+              sleep 2
+            done
+            docker logs "${CONTAINER}"
+            return 1
+          }
+
+          wait_for_health
+          curl --fail --silent --show-error --output /dev/null "http://127.0.0.1:${PORT}/"
+
+          actual_user="$(docker inspect --format '{{.Config.User}}' "${CONTAINER}")"
+          [[ "${actual_user}" == "10001:10001" ]]
+
+          actual_platform="$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "${IMAGE}")"
+          [[ "${actual_platform}" == "${EXPECTED_PLATFORM}" ]]
+
+          docker exec "${CONTAINER}" sh -c 'printf persisted > /data/.docker-smoke'
+          docker restart "${CONTAINER}" >/dev/null
+          wait_for_health
+          docker exec "${CONTAINER}" grep -qx persisted /data/.docker-smoke
+
+  upstream-publish:
+    name: Publish upstream version and latest
+    needs: [upstream-check, upstream-smoke]
+    if: >-
+      needs.upstream-check.outputs.exists == 'false' &&
+      (github.event_name == 'push' ||
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' && inputs.push))
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout packaging files
+        uses: actions/checkout@v6
+        with:
+          path: packaging
+
+      - name: Checkout upstream release
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.UPSTREAM_REPOSITORY }}
+          ref: ${{ needs.upstream-check.outputs.tag }}
+          fetch-depth: 1
+          path: upstream
+
+      - name: Apply Docker packaging and build compatibility files
+        env:
+          UPSTREAM_VERSION: ${{ needs.upstream-check.outputs.version }}
+        run: |
+          set -euo pipefail
+          cp packaging/Dockerfile packaging/.dockerignore packaging/package.json packaging/vite.config.ts upstream/
+          node -e "const fs = require('fs'); const path = 'upstream/package.json'; const pkg = JSON.parse(fs.readFileSync(path)); pkg.version = process.env.UPSTREAM_VERSION; fs.writeFileSync(path, JSON.stringify(pkg, null, 2) + '\n')"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push upstream release
+        id: push
+        uses: docker/build-push-action@v7
+        with:
+          context: upstream
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.upstream-check.outputs.version }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          provenance: mode=max
+          sbom: true
+          cache-from: |
+            type=gha,scope=errata-upstream-multiarch
+            type=gha,scope=errata-upstream-amd64
+            type=gha,scope=errata-upstream-arm64
+          cache-to: type=gha,scope=errata-upstream-multiarch,mode=max
+
+      - name: Verify published upstream manifest
+        env:
+          IMAGE_DIGEST: ${{ steps.push.outputs.digest }}
+          UPSTREAM_VERSION: ${{ needs.upstream-check.outputs.version }}
+        run: |
+          image="${REGISTRY}/${IMAGE_NAME}@${IMAGE_DIGEST}"
+          docker buildx imagetools inspect "${image}"
+          {
+            echo "### Published upstream Docker image"
+            echo
+            echo "Version: ${UPSTREAM_VERSION}"
+            echo
+            echo "\`${image}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
