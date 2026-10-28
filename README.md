@@ -89,6 +89,8 @@ chmod +x errata
 
 Set `DATA_DIR` to control where story data is stored (default: `./data`).
 
+For a containerized deployment, see the [Docker and GHCR guide](docs/docker.md). The image supports `linux/amd64` and `linux/arm64`.
+
 ## Environment Variables
 
 | Variable | Default | Description |

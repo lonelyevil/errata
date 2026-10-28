@@ -16,6 +16,8 @@
   - How to build external plugins, use runtime iframe UI, scaffold from templates, client-side panel hooks (`onPanelOpen`/`onPanelClose` for bundled, `postMessage` for iframe), query cache invalidation, and validate in dev.
 - `docs/runtime-plugins-and-binary-packaging.md`
   - Runtime plugin loading, binary build/package workflow, CI release automation, and deployment notes.
+- `docs/docker.md`
+  - Docker image design, linux/amd64 + linux/arm64 builds, Compose, GHCR Actions publishing, and deployment guide.
 - `docs/component-ids.md`
   - Frontend `data-component-id` contract for extensibility and automation.
 - `docs/publishing-plugin-sdk.md`

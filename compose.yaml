@@ -1,0 +1,20 @@
+name: errata
+
+services:
+  errata:
+    image: errata:local
+    build:
+      context: .
+    ports:
+      - "127.0.0.1:7739:7739"
+      # Uncomment when using OpenRouter OAuth on the Docker host.
+      # - "127.0.0.1:3000:3000"
+    volumes:
+      - errata-data:/data
+      # Uncomment to load trusted external plugins from the host.
+      # - ./plugins:/plugins
+    init: true
+    restart: unless-stopped
+
+volumes:
+  errata-data:
