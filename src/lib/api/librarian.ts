@@ -1,4 +1,5 @@
 import { apiFetch, fetchEventStream, fetchGetEventStream } from './client'
+import type { LibrarianChatSnapshot, LibrarianChatStartInput } from '@/lib/librarian-chat'
 import type {
   LibrarianState,
   LibrarianAnalysisSummary,
@@ -9,7 +10,26 @@ import type {
   AgentRunTraceRecord,
 } from './types'
 
+function branchQuery(branchId?: string): string {
+  return branchId ? `?branchId=${encodeURIComponent(branchId)}` : ''
+}
+
+function chatPath(storyId: string, conversationId?: string | null): string {
+  const base = `/stories/${encodeURIComponent(storyId)}/librarian`
+  return conversationId ? `${base}/conversations/${encodeURIComponent(conversationId)}` : base
+}
+
 export const librarian = {
+  getChatState: (storyId: string, branchId: string, conversationId?: string | null, signal?: AbortSignal) =>
+    apiFetch<LibrarianChatSnapshot>(`${chatPath(storyId, conversationId)}/chat-state${branchQuery(branchId)}`, { signal, cache: 'no-store' }),
+  startChatRun: (storyId: string, input: LibrarianChatStartInput, conversationId?: string | null, signal?: AbortSignal) =>
+    apiFetch<LibrarianChatSnapshot>(`${chatPath(storyId, conversationId)}/chat-runs`, {
+      method: 'POST', body: JSON.stringify(input), signal,
+    }),
+  cancelChatRun: (storyId: string, branchId: string, runId: string, conversationId?: string | null, signal?: AbortSignal) =>
+    apiFetch<LibrarianChatSnapshot>(`${chatPath(storyId, conversationId)}/chat-runs/${encodeURIComponent(runId)}/cancel${branchQuery(branchId)}`, {
+      method: 'POST', signal,
+    }),
   getStatus: (storyId: string) =>
     apiFetch<LibrarianState>(`/stories/${storyId}/librarian/status`),
   getAnalysisIndex: (storyId: string) =>
@@ -55,26 +75,26 @@ export const librarian = {
   }),
   chat: (storyId: string, messages: Array<{ role: 'user' | 'assistant'; content: string }>) =>
     fetchEventStream(`/stories/${storyId}/librarian/chat`, { messages }),
-  getChatHistory: (storyId: string) =>
-    apiFetch<ChatHistory>(`/stories/${storyId}/librarian/chat`),
-  clearChatHistory: (storyId: string) =>
-    apiFetch<{ ok: boolean }>(`/stories/${storyId}/librarian/chat`, { method: 'DELETE' }),
+  getChatHistory: (storyId: string, branchId?: string) =>
+    apiFetch<ChatHistory>(`${chatPath(storyId)}/chat${branchQuery(branchId)}`),
+  clearChatHistory: (storyId: string, branchId?: string) =>
+    apiFetch<{ ok: boolean }>(`${chatPath(storyId)}/chat${branchQuery(branchId)}`, { method: 'DELETE' }),
   getAnalysisStream: (storyId: string) =>
     fetchGetEventStream(`/stories/${storyId}/librarian/analysis-stream`),
   // Conversations
-  listConversations: (storyId: string) =>
-    apiFetch<ConversationMeta[]>(`/stories/${storyId}/librarian/conversations`),
-  createConversation: (storyId: string, title?: string) =>
-    apiFetch<ConversationMeta>(`/stories/${storyId}/librarian/conversations`, {
+  listConversations: (storyId: string, branchId?: string) =>
+    apiFetch<ConversationMeta[]>(`${chatPath(storyId)}/conversations${branchQuery(branchId)}`),
+  createConversation: (storyId: string, title?: string, branchId?: string) =>
+    apiFetch<ConversationMeta>(`${chatPath(storyId)}/conversations${branchQuery(branchId)}`, {
       method: 'POST',
       body: JSON.stringify({ title }),
     }),
-  deleteConversation: (storyId: string, conversationId: string) =>
-    apiFetch<{ ok: boolean }>(`/stories/${storyId}/librarian/conversations/${conversationId}`, {
+  deleteConversation: (storyId: string, conversationId: string, branchId?: string) =>
+    apiFetch<{ ok: boolean }>(`${chatPath(storyId, conversationId)}${branchQuery(branchId)}`, {
       method: 'DELETE',
     }),
-  getConversationHistory: (storyId: string, conversationId: string) =>
-    apiFetch<ChatHistory>(`/stories/${storyId}/librarian/conversations/${conversationId}/chat`),
+  getConversationHistory: (storyId: string, conversationId: string, branchId?: string) =>
+    apiFetch<ChatHistory>(`${chatPath(storyId, conversationId)}/chat${branchQuery(branchId)}`),
   conversationChat: (storyId: string, conversationId: string, messages: Array<{ role: 'user' | 'assistant'; content: string }>) =>
     fetchEventStream(`/stories/${storyId}/librarian/conversations/${conversationId}/chat`, { messages }),
 }

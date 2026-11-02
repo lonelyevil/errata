@@ -4,6 +4,7 @@ import { existsSync } from 'node:fs'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { getContentRoot } from '../fragments/branches'
 import { generateConversationId } from '@/lib/fragment-ids'
+import type { LibrarianChatMessage, LibrarianChatSnapshot, LibrarianChatStatus } from '@/lib/librarian-chat'
 import { writeJsonAtomic } from '../fs-utils'
 import { withKeyLock } from '../async-lock'
 
@@ -439,15 +440,114 @@ export async function saveState(
 
 // --- Chat history ---
 
+/**
+ * One canonical history document backs both the legacy chat endpoints and the
+ * server-owned run snapshot. Older documents only had `messages`/`updatedAt`;
+ * the run bookkeeping fields are optional so legacy readers keep working.
+ */
+export interface ChatHistoryToolCall {
+  id: string
+  toolName: string
+  args: Record<string, unknown>
+  result?: unknown
+}
+
 export interface ChatHistoryMessage {
+  /** Optional only for legacy documents. New writes always assign an ID. */
+  id?: string
   role: 'user' | 'assistant'
   content: string
   reasoning?: string
+  toolCalls?: ChatHistoryToolCall[]
+  runId?: string
+  status?: LibrarianChatStatus
+  error?: string
+}
+
+/** Metadata retained for every accepted run so retries dedupe after restart. */
+export interface ChatRunRecord {
+  runId: string
+  prompt: string
+  branchId: string
+  expectedRevision: number
+  maxSteps?: number
+  status: LibrarianChatStatus
+  startedAt: string
+  updatedAt: string
+  messageId: string
+  assistantMessageId: string
+  finishedAt?: string
+  cancelledAt?: string
+  error?: string
+}
+
+export interface ChatActiveRun {
+  runId: string
+  status: 'running' | 'cancelling'
+  prompt: string
+  branchId: string
+  expectedRevision: number
+  maxSteps?: number
+  startedAt: string
+  messageId: string
+  assistantMessageId: string
 }
 
 export interface ChatHistory {
   messages: ChatHistoryMessage[]
   updatedAt: string
+  /** Monotonic snapshot revision. Missing in legacy documents (treated as 0). */
+  revision?: number
+  /** Branch this document belongs to. Storage is already branch-scoped. */
+  branchId?: string
+  activeRun?: ChatActiveRun | null
+  runs?: Record<string, ChatRunRecord>
+}
+
+/** Typed conflict raised while a server-owned run is active (HTTP 409). */
+export class ChatHistoryConflictError extends Error {
+  readonly status = 409
+
+  constructor(message: string) {
+    super(message)
+    this.name = 'ChatHistoryConflictError'
+  }
+}
+
+const SAFE_CHAT_ID = /^[A-Za-z0-9_-]{1,128}$/
+
+export function isSafeChatId(value: string): boolean {
+  return SAFE_CHAT_ID.test(value)
+}
+
+function assertSafeChatId(value: string, label: string): void {
+  if (!isSafeChatId(value)) {
+    throw new Error(`Invalid ${label}`)
+  }
+}
+
+function normalizeChatHistory(value: unknown): ChatHistory {
+  const parsed = (value && typeof value === 'object' ? value : {}) as Partial<ChatHistory>
+  const messages = Array.isArray(parsed.messages)
+    ? parsed.messages.filter((m): m is ChatHistoryMessage => {
+        if (!m || typeof m !== 'object') return false
+        const candidate = m as Partial<ChatHistoryMessage>
+        return (candidate.role === 'user' || candidate.role === 'assistant') && typeof candidate.content === 'string'
+      })
+    : []
+
+  return {
+    messages,
+    updatedAt: typeof parsed.updatedAt === 'string' ? parsed.updatedAt : new Date().toISOString(),
+    revision: typeof parsed.revision === 'number' && Number.isFinite(parsed.revision) && parsed.revision >= 0
+      ? Math.floor(parsed.revision)
+      : 0,
+    ...(typeof parsed.branchId === 'string' ? { branchId: parsed.branchId } : {}),
+    activeRun: parsed.activeRun && typeof parsed.activeRun === 'object'
+      ? parsed.activeRun
+      : null,
+    runs: parsed.runs && typeof parsed.runs === 'object' ? parsed.runs : {},
+  }
 }
 
 async function chatHistoryPath(dataDir: string, storyId: string): Promise<string> {
@@ -455,39 +555,199 @@ async function chatHistoryPath(dataDir: string, storyId: string): Promise<string
   return join(dir, 'chat-history.json')
 }
 
+function defaultChatHistory(): ChatHistory {
+  return {
+    messages: [],
+    updatedAt: new Date().toISOString(),
+    revision: 0,
+    activeRun: null,
+    runs: {},
+  }
+}
+
+async function readChatHistoryFile(path: string): Promise<ChatHistory> {
+  if (!existsSync(path)) return defaultChatHistory()
+  const raw = await readFile(path, 'utf-8')
+  return normalizeChatHistory(JSON.parse(raw))
+}
+
 export async function getChatHistory(
   dataDir: string,
   storyId: string,
 ): Promise<ChatHistory> {
-  const path = await chatHistoryPath(dataDir, storyId)
-  if (!existsSync(path)) {
-    return { messages: [], updatedAt: new Date().toISOString() }
-  }
-  const raw = await readFile(path, 'utf-8')
-  return JSON.parse(raw) as ChatHistory
+  return readChatHistoryFile(await chatHistoryPath(dataDir, storyId))
 }
 
+export async function getConversationHistory(
+  dataDir: string,
+  storyId: string,
+  conversationId: string,
+): Promise<ChatHistory> {
+  assertSafeChatId(conversationId, 'conversation ID')
+  const dir = await librarianDir(dataDir, storyId)
+  return readChatHistoryFile(conversationHistoryPath(dir, conversationId))
+}
+
+/**
+ * Read the canonical document for a scope. `conversationId = null` selects the
+ * legacy default chat document.
+ */
+export async function readChatHistoryDocument(
+  dataDir: string,
+  storyId: string,
+  conversationId?: string | null,
+): Promise<ChatHistory> {
+  if (conversationId) {
+    return getConversationHistory(dataDir, storyId, conversationId)
+  }
+  return getChatHistory(dataDir, storyId)
+}
+
+/**
+ * Apply a mutation to the canonical history document under a per-document lock,
+ * then atomically write it. Conversation histories are never created if the
+ * conversation no longer exists in the index, so a deleted conversation cannot
+ * be resurrected by a late writer.
+ *
+ * Returns null when the conversation is missing.
+ */
+export interface MutateChatHistoryOptions {
+  /** Refuse to mutate while a server-owned run is active. */
+  rejectIfActive?: boolean
+  /** Only write if the document is still at this revision (legacy fence). */
+  expectedRevision?: number
+}
+
+export async function mutateChatHistoryDocument(
+  dataDir: string,
+  storyId: string,
+  conversationId: string | null | undefined,
+  mutate: (history: ChatHistory) => void | Promise<void>,
+  options: MutateChatHistoryOptions = {},
+): Promise<ChatHistory | null> {
+  if (conversationId) assertSafeChatId(conversationId, 'conversation ID')
+
+  const dir = await librarianDir(dataDir, storyId)
+  const path = conversationId
+    ? conversationHistoryPath(dir, conversationId)
+    : join(dir, 'chat-history.json')
+  const lockKey = `librarian-chat-history:${path}`
+
+  return withKeyLock(lockKey, async () => {
+    if (conversationId && !(await conversationExistsUnlocked(dataDir, storyId, conversationId))) {
+      return null
+    }
+
+    const history = await readChatHistoryFile(path)
+    if (options.rejectIfActive && history.activeRun) {
+      throw new ChatHistoryConflictError('Cannot modify chat history while a run is active')
+    }
+    if (
+      options.expectedRevision !== undefined
+      && (history.revision ?? 0) !== options.expectedRevision
+    ) {
+      throw new ChatHistoryConflictError('Chat history changed since this legacy request started')
+    }
+    await mutate(history)
+    history.updatedAt = new Date().toISOString()
+    history.revision = (history.revision ?? 0) + 1
+
+    await mkdir(dir, { recursive: true })
+    await writeJsonAtomic(path, history)
+
+    if (conversationId) {
+      const firstUser = history.messages.find(message => message.role === 'user')?.content
+      await touchConversationMeta(dataDir, storyId, conversationId, history.updatedAt, firstUser)
+    }
+    return history
+  })
+}
+
+export interface LegacyChatHistoryWriteOptions {
+  /**
+   * Revision captured when the legacy streaming request started. A mismatch
+   * means a newer server-owned turn committed first, so the old completion
+   * must not replace it.
+   */
+  expectedRevision?: number
+}
+
+/**
+ * Persist a legacy transcript. Returns false (and leaves the file untouched)
+ * when a server-owned run is active or the optional revision fence no longer
+ * matches. The active check and write share the document lock, so a run that
+ * is accepted concurrently cannot be overwritten.
+ */
 export async function saveChatHistory(
   dataDir: string,
   storyId: string,
   messages: ChatHistoryMessage[],
-): Promise<void> {
-  const dir = await librarianDir(dataDir, storyId)
-  await mkdir(dir, { recursive: true })
-  const history: ChatHistory = {
-    messages,
-    updatedAt: new Date().toISOString(),
+  options: LegacyChatHistoryWriteOptions = {},
+): Promise<boolean> {
+  try {
+    const history = await mutateChatHistoryDocument(dataDir, storyId, null, (doc) => {
+      doc.messages = messages
+    }, {
+      rejectIfActive: true,
+      ...(options.expectedRevision !== undefined ? { expectedRevision: options.expectedRevision } : {}),
+    })
+    return history !== null
+  } catch (error) {
+    if (error instanceof ChatHistoryConflictError) return false
+    throw error
   }
-  await writeJsonAtomic(await chatHistoryPath(dataDir, storyId), history)
 }
 
+/**
+ * Clear the visible transcript while retaining the run ledger. Keeping the
+ * ledger preserves start-run dedupe (a client retrying a lost POST after a
+ * clear still gets the same accepted run instead of a second side-effecting
+ * execution).
+ */
 export async function clearChatHistory(
   dataDir: string,
   storyId: string,
 ): Promise<void> {
-  const path = await chatHistoryPath(dataDir, storyId)
-  if (existsSync(path)) {
-    await unlink(path)
+  const dir = await librarianDir(dataDir, storyId)
+  const path = join(dir, 'chat-history.json')
+  await withKeyLock(`librarian-chat-history:${path}`, async () => {
+    if (!existsSync(path)) return
+    const history = await readChatHistoryFile(path)
+    // The route's snapshot check is advisory; this lock is the authority. A
+    // run accepted between the check and this call must win.
+    if (history.activeRun) {
+      throw new ChatHistoryConflictError('Cannot clear chat history while a run is active')
+    }
+    history.messages = []
+    history.updatedAt = new Date().toISOString()
+    history.revision = (history.revision ?? 0) + 1
+    await writeJsonAtomic(path, history)
+  })
+}
+
+export function toLibrarianChatSnapshot(history: ChatHistory, branchId: string): LibrarianChatSnapshot {
+  const messages: LibrarianChatMessage[] = history.messages.map((message, index) => {
+    const converted: LibrarianChatMessage = {
+      id: message.id ?? `msg-legacy-${index}`,
+      role: message.role,
+      content: message.content,
+      ...(message.reasoning !== undefined ? { reasoning: message.reasoning } : {}),
+      ...(message.toolCalls !== undefined ? { toolCalls: message.toolCalls } : {}),
+      ...(message.runId !== undefined ? { runId: message.runId } : {}),
+      ...(message.status !== undefined ? { status: message.status } : {}),
+      ...(message.error !== undefined ? { error: message.error } : {}),
+    }
+    return converted
+  })
+
+  return {
+    branchId,
+    revision: history.revision ?? 0,
+    updatedAt: history.updatedAt,
+    messages,
+    activeRun: history.activeRun
+      ? { runId: history.activeRun.runId, status: history.activeRun.status }
+      : null,
   }
 }
 
@@ -510,6 +770,7 @@ async function conversationsIndexPath(dataDir: string, storyId: string): Promise
 }
 
 function conversationHistoryPath(dir: string, conversationId: string): string {
+  assertSafeChatId(conversationId, 'conversation ID')
   return join(dir, `chat-${conversationId}.json`)
 }
 
@@ -518,7 +779,7 @@ async function readConversationsIndex(dataDir: string, storyId: string): Promise
   if (!existsSync(path)) return { conversations: [] }
   const raw = await readFile(path, 'utf-8')
   const parsed = JSON.parse(raw) as Partial<ConversationsIndex>
-  return { conversations: parsed.conversations ?? [] }
+  return { conversations: Array.isArray(parsed.conversations) ? parsed.conversations : [] }
 }
 
 async function writeConversationsIndex(dataDir: string, storyId: string, index: ConversationsIndex): Promise<void> {
@@ -527,24 +788,84 @@ async function writeConversationsIndex(dataDir: string, storyId: string, index: 
   await writeJsonAtomic(await conversationsIndexPath(dataDir, storyId), index)
 }
 
+function conversationsLockKey(dataDir: string, storyId: string): Promise<string> {
+  return conversationsIndexPath(dataDir, storyId).then(path => `librarian-conversations:${path}`)
+}
+
+async function conversationExistsUnlocked(
+  dataDir: string,
+  storyId: string,
+  conversationId: string,
+): Promise<boolean> {
+  const index = await readConversationsIndex(dataDir, storyId)
+  return index.conversations.some(c => c.id === conversationId)
+}
+
+/**
+ * Serializes all read-modify-write updates to the conversation index. Multiple
+ * named conversations may run concurrently, but index updates must never
+ * clobber each other.
+ */
+async function withConversationsIndexLock<T>(
+  dataDir: string,
+  storyId: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  return withKeyLock(await conversationsLockKey(dataDir, storyId), fn)
+}
+
+async function touchConversationMeta(
+  dataDir: string,
+  storyId: string,
+  conversationId: string,
+  updatedAt: string,
+  firstUserContent?: string,
+): Promise<void> {
+  await withConversationsIndexLock(dataDir, storyId, async () => {
+    const index = await readConversationsIndex(dataDir, storyId)
+    const conv = index.conversations.find(c => c.id === conversationId)
+    if (!conv) return
+    conv.updatedAt = updatedAt
+    // Preserve the legacy auto-title behavior: the first user message names a
+    // still-default conversation.
+    if (conv.title === 'New chat' && firstUserContent) {
+      conv.title = firstUserContent.slice(0, 60).trim() || 'New chat'
+    }
+    await writeConversationsIndex(dataDir, storyId, index)
+  })
+}
+
+/** Test/utility helper: whether the conversation currently exists in the index. */
+export async function conversationExists(
+  dataDir: string,
+  storyId: string,
+  conversationId: string,
+): Promise<boolean> {
+  if (!isSafeChatId(conversationId)) return false
+  return conversationExistsUnlocked(dataDir, storyId, conversationId)
+}
+
 export async function listConversations(dataDir: string, storyId: string): Promise<ConversationMeta[]> {
   const index = await readConversationsIndex(dataDir, storyId)
-  // Most recently updated first
-  return index.conversations.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+  // Most recently updated first. Copy before sorting so a concurrent reader
+  // never observes an in-place mutation of the stored array.
+  return [...index.conversations].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
 }
 
 export async function createConversation(dataDir: string, storyId: string, title: string): Promise<ConversationMeta> {
-  const index = await readConversationsIndex(dataDir, storyId)
-  const now = new Date().toISOString()
-  const conversation: ConversationMeta = {
-    id: generateConversationId(),
-    title,
-    createdAt: now,
-    updatedAt: now,
-  }
-  index.conversations.push(conversation)
-  await writeConversationsIndex(dataDir, storyId, index)
-  return conversation
+  return withConversationsIndexLock(dataDir, storyId, async () => {
+    const index = await readConversationsIndex(dataDir, storyId)
+    const now = new Date().toISOString()
+    const conversation: ConversationMeta = {
+      id: generateConversationId(),
+      title,
+      createdAt: now,
+      updatedAt: now,
+    }
+    index.conversations.push(conversation)
+    await writeConversationsIndex(dataDir, storyId, index)
+    return conversation
+  })
 }
 
 export async function updateConversationTitle(
@@ -553,60 +874,69 @@ export async function updateConversationTitle(
   conversationId: string,
   title: string,
 ): Promise<ConversationMeta | null> {
-  const index = await readConversationsIndex(dataDir, storyId)
-  const conv = index.conversations.find(c => c.id === conversationId)
-  if (!conv) return null
-  conv.title = title
-  conv.updatedAt = new Date().toISOString()
-  await writeConversationsIndex(dataDir, storyId, index)
-  return conv
+  if (!isSafeChatId(conversationId)) return null
+  return withConversationsIndexLock(dataDir, storyId, async () => {
+    const index = await readConversationsIndex(dataDir, storyId)
+    const conv = index.conversations.find(c => c.id === conversationId)
+    if (!conv) return null
+    conv.title = title
+    conv.updatedAt = new Date().toISOString()
+    await writeConversationsIndex(dataDir, storyId, index)
+    return conv
+  })
 }
 
 export async function deleteConversation(dataDir: string, storyId: string, conversationId: string): Promise<boolean> {
-  const index = await readConversationsIndex(dataDir, storyId)
-  const idx = index.conversations.findIndex(c => c.id === conversationId)
-  if (idx === -1) return false
-  index.conversations.splice(idx, 1)
-  await writeConversationsIndex(dataDir, storyId, index)
-  // Delete history file
+  if (!isSafeChatId(conversationId)) return false
+
   const dir = await librarianDir(dataDir, storyId)
   const historyFile = conversationHistoryPath(dir, conversationId)
-  if (existsSync(historyFile)) await unlink(historyFile)
-  return true
+  // Lock order is always history → index, matching mutateChatHistoryDocument.
+  return withKeyLock(`librarian-chat-history:${historyFile}`, () =>
+    withConversationsIndexLock(dataDir, storyId, async () => {
+      // Re-check under the same lock the run acceptance uses. This closes the
+      // check-then-delete race where a new run could be accepted in between.
+      if (existsSync(historyFile)) {
+        const history = await readChatHistoryFile(historyFile)
+        if (history.activeRun) {
+          throw new ChatHistoryConflictError('Cannot delete a conversation while a run is active')
+        }
+      }
+
+      const index = await readConversationsIndex(dataDir, storyId)
+      const idx = index.conversations.findIndex(c => c.id === conversationId)
+      if (idx === -1) return false
+      index.conversations.splice(idx, 1)
+      await writeConversationsIndex(dataDir, storyId, index)
+      if (existsSync(historyFile)) await unlink(historyFile)
+      return true
+    }),
+  )
 }
 
-export async function getConversationHistory(
-  dataDir: string,
-  storyId: string,
-  conversationId: string,
-): Promise<ChatHistory> {
-  const dir = await librarianDir(dataDir, storyId)
-  const path = conversationHistoryPath(dir, conversationId)
-  if (!existsSync(path)) return { messages: [], updatedAt: new Date().toISOString() }
-  const raw = await readFile(path, 'utf-8')
-  return JSON.parse(raw) as ChatHistory
-}
-
+/**
+ * Persist a legacy conversation transcript. Returns false when the
+ * conversation no longer exists so a deleted conversation cannot be
+ * resurrected by an in-flight legacy completion.
+ */
 export async function saveConversationHistory(
   dataDir: string,
   storyId: string,
   conversationId: string,
   messages: ChatHistoryMessage[],
-): Promise<void> {
-  const dir = await librarianDir(dataDir, storyId)
-  await mkdir(dir, { recursive: true })
-  const history: ChatHistory = { messages, updatedAt: new Date().toISOString() }
-  await writeJsonAtomic(conversationHistoryPath(dir, conversationId), history)
-  // Update conversation timestamp
-  const index = await readConversationsIndex(dataDir, storyId)
-  const conv = index.conversations.find(c => c.id === conversationId)
-  if (conv) {
-    conv.updatedAt = history.updatedAt
-    // Auto-title from first user message if still default
-    if (conv.title === 'New chat' && messages.length > 0) {
-      const firstUser = messages.find(m => m.role === 'user')
-      if (firstUser) conv.title = firstUser.content.slice(0, 60).trim() || 'New chat'
-    }
-    await writeConversationsIndex(dataDir, storyId, index)
+  options: LegacyChatHistoryWriteOptions = {},
+): Promise<boolean> {
+  assertSafeChatId(conversationId, 'conversation ID')
+  try {
+    const history = await mutateChatHistoryDocument(dataDir, storyId, conversationId, (doc) => {
+      doc.messages = messages
+    }, {
+      rejectIfActive: true,
+      ...(options.expectedRevision !== undefined ? { expectedRevision: options.expectedRevision } : {}),
+    })
+    return history !== null
+  } catch (error) {
+    if (error instanceof ChatHistoryConflictError) return false
+    throw error
   }
 }

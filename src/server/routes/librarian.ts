@@ -1,5 +1,6 @@
 import { Elysia, t } from 'elysia'
 import { getStory, getFragment, updateFragment, updateStory } from '../fragments/storage'
+import { getBranchesIndex, withBranch } from '../fragments/branches'
 import {
   getGenerationLog,
   listGenerationLogs,
@@ -20,14 +21,54 @@ import {
   deleteConversation,
   getConversationHistory,
   saveConversationHistory,
+  conversationExists,
+  isSafeChatId,
   getLatestAnalysisIdsByFragment,
+  ChatHistoryConflictError,
 } from '../librarian/storage'
+import {
+  cancelLibrarianChatRun,
+  getLibrarianChatSnapshot,
+  startLibrarianChatRun,
+  LibrarianChatRequestError,
+} from '../librarian/chat-state'
 import { applyFragmentSuggestion } from '../librarian/suggestions'
 import { createLogger } from '../logging'
 import { encodeStream } from './encode-stream'
+import type { LibrarianChatStartInput } from '@/lib/librarian-chat'
 
 export function librarianRoutes(dataDir: string) {
   const logger = createLogger('api:librarian', { dataDir })
+
+  function requestedBranchId(query: unknown): string | undefined {
+    const raw = (query as { branchId?: unknown } | undefined)?.branchId
+    return typeof raw === 'string' && raw.length > 0 ? raw : undefined
+  }
+
+  /**
+   * Resolve and validate a branch scope. Branch IDs are checked against the
+   * story's index, which also prevents path traversal through `?branchId=`.
+   * With no query parameter the active branch is used (old clients unaffected).
+   */
+  async function resolveBranchId(storyId: string, requested?: string): Promise<string | null> {
+    const story = await getStory(dataDir, storyId)
+    if (!story) return null
+    const index = await getBranchesIndex(dataDir, storyId)
+    if (requested !== undefined) {
+      if (!isSafeChatId(requested)) return null
+      return index.branches.some(b => b.id === requested) ? requested : null
+    }
+    if (!isSafeChatId(index.activeBranchId)) return null
+    return index.activeBranchId
+  }
+
+  function chatErrorResponse(set: { status?: number | string }, error: unknown): { error: string } | never {
+    if (error instanceof LibrarianChatRequestError) {
+      set.status = error.status
+      return { error: error.message }
+    }
+    throw error
+  }
 
   return new Elysia({ detail: { tags: ['Librarian'] } })
     // --- Generation Logs ---
@@ -363,19 +404,203 @@ export function librarianRoutes(dataDir: string) {
       detail: { summary: 'Transform a prose selection (streaming NDJSON)' },
     })
 
-    // --- Librarian Chat ---
-    .get('/stories/:storyId/librarian/chat', async ({ params }) => {
-      return getLibrarianChatHistory(dataDir, params.storyId)
+    // --- Server-owned Librarian Chat Runs ---
+    .get('/stories/:storyId/librarian/chat-state', async ({ params, query, set }) => {
+      const branchId = await resolveBranchId(params.storyId, requestedBranchId(query))
+      if (!branchId) {
+        set.status = 404
+        return { error: 'Story or branch not found' }
+      }
+      try {
+        return await getLibrarianChatSnapshot(dataDir, params.storyId, branchId, null)
+      } catch (err) {
+        return chatErrorResponse(set, err)
+      }
+    }, { detail: { summary: 'Get the full librarian chat snapshot for the default chat' } })
+
+    .get('/stories/:storyId/librarian/conversations/:conversationId/chat-state', async ({ params, query, set }) => {
+      const branchId = await resolveBranchId(params.storyId, requestedBranchId(query))
+      if (!branchId) {
+        set.status = 404
+        return { error: 'Story or branch not found' }
+      }
+      return withBranch(dataDir, params.storyId, async () => {
+        if (!(await conversationExists(dataDir, params.storyId, params.conversationId))) {
+          set.status = 404
+          return { error: 'Conversation not found' }
+        }
+        try {
+          return await getLibrarianChatSnapshot(
+            dataDir,
+            params.storyId,
+            branchId,
+            params.conversationId,
+          )
+        } catch (err) {
+          return chatErrorResponse(set, err)
+        }
+      }, branchId)
+    }, { detail: { summary: 'Get the full librarian chat snapshot for a conversation' } })
+
+    .post('/stories/:storyId/librarian/chat-runs', async ({ params, body, query, set }) => {
+      const input = body as LibrarianChatStartInput
+      const branchId = await resolveBranchId(params.storyId, input.branchId)
+      if (!branchId || branchId !== input.branchId) {
+        set.status = 404
+        return { error: 'Story or branch not found' }
+      }
+      const queriedBranch = requestedBranchId(query)
+      if (queriedBranch && queriedBranch !== branchId) {
+        set.status = 422
+        return { error: 'branchId query does not match request branchId' }
+      }
+      try {
+        const result = await startLibrarianChatRun(dataDir, params.storyId, null, input)
+        return result.snapshot
+      } catch (err) {
+        return chatErrorResponse(set, err)
+      }
+    }, {
+      body: t.Object({
+        runId: t.String({ minLength: 1, maxLength: 128 }),
+        prompt: t.String({ minLength: 1, maxLength: 100_000 }),
+        branchId: t.String({ minLength: 1, maxLength: 128 }),
+        expectedRevision: t.Integer({ minimum: 0 }),
+        maxSteps: t.Optional(t.Integer({ minimum: 1, maximum: 100 })),
+      }),
+      detail: { summary: 'Submit a librarian chat run for the default chat' },
+    })
+
+    .post('/stories/:storyId/librarian/conversations/:conversationId/chat-runs', async ({ params, body, query, set }) => {
+      const input = body as LibrarianChatStartInput
+      const branchId = await resolveBranchId(params.storyId, input.branchId)
+      if (!branchId || branchId !== input.branchId) {
+        set.status = 404
+        return { error: 'Story or branch not found' }
+      }
+      const queriedBranch = requestedBranchId(query)
+      if (queriedBranch && queriedBranch !== branchId) {
+        set.status = 422
+        return { error: 'branchId query does not match request branchId' }
+      }
+      return withBranch(dataDir, params.storyId, async () => {
+        if (!(await conversationExists(dataDir, params.storyId, params.conversationId))) {
+          set.status = 404
+          return { error: 'Conversation not found' }
+        }
+        try {
+          const result = await startLibrarianChatRun(
+            dataDir,
+            params.storyId,
+            params.conversationId,
+            input,
+          )
+          return result.snapshot
+        } catch (err) {
+          return chatErrorResponse(set, err)
+        }
+      }, branchId)
+    }, {
+      body: t.Object({
+        runId: t.String({ minLength: 1, maxLength: 128 }),
+        prompt: t.String({ minLength: 1, maxLength: 100_000 }),
+        branchId: t.String({ minLength: 1, maxLength: 128 }),
+        expectedRevision: t.Integer({ minimum: 0 }),
+        maxSteps: t.Optional(t.Integer({ minimum: 1, maximum: 100 })),
+      }),
+      detail: { summary: 'Submit a librarian chat run for a conversation' },
+    })
+
+    .post('/stories/:storyId/librarian/chat-runs/:runId/cancel', async ({ params, query, set }) => {
+      const branchId = await resolveBranchId(params.storyId, requestedBranchId(query))
+      if (!branchId) {
+        set.status = 404
+        return { error: 'Story or branch not found' }
+      }
+      try {
+        return await cancelLibrarianChatRun(
+          dataDir,
+          params.storyId,
+          branchId,
+          null,
+          params.runId,
+        )
+      } catch (err) {
+        return chatErrorResponse(set, err)
+      }
+    }, { detail: { summary: 'Cancel a librarian chat run for the default chat' } })
+
+    .post('/stories/:storyId/librarian/conversations/:conversationId/chat-runs/:runId/cancel', async ({ params, query, set }) => {
+      const branchId = await resolveBranchId(params.storyId, requestedBranchId(query))
+      if (!branchId) {
+        set.status = 404
+        return { error: 'Story or branch not found' }
+      }
+      return withBranch(dataDir, params.storyId, async () => {
+        if (!(await conversationExists(dataDir, params.storyId, params.conversationId))) {
+          set.status = 404
+          return { error: 'Conversation not found' }
+        }
+        try {
+          return await cancelLibrarianChatRun(
+            dataDir,
+            params.storyId,
+            branchId,
+            params.conversationId,
+            params.runId,
+          )
+        } catch (err) {
+          return chatErrorResponse(set, err)
+        }
+      }, branchId)
+    }, { detail: { summary: 'Cancel a librarian chat run for a conversation' } })
+
+    // --- Librarian Chat (legacy streaming endpoints) ---
+    .get('/stories/:storyId/librarian/chat', async ({ params, query, set }) => {
+      const branchId = await resolveBranchId(params.storyId, requestedBranchId(query))
+      if (!branchId) {
+        set.status = 404
+        return { error: 'Story or branch not found' }
+      }
+      return withBranch(dataDir, params.storyId, () => getLibrarianChatHistory(dataDir, params.storyId), branchId)
     }, { detail: { summary: 'Get chat history' } })
 
-    .delete('/stories/:storyId/librarian/chat', async ({ params }) => {
-      await clearLibrarianChatHistory(dataDir, params.storyId)
-      return { ok: true }
+    .delete('/stories/:storyId/librarian/chat', async ({ params, query, set }) => {
+      const branchId = await resolveBranchId(params.storyId, requestedBranchId(query))
+      if (!branchId) {
+        set.status = 404
+        return { error: 'Story or branch not found' }
+      }
+      return withBranch(dataDir, params.storyId, async () => {
+        const snapshot = await getLibrarianChatSnapshot(dataDir, params.storyId, branchId, null)
+        if (snapshot.activeRun) {
+          set.status = 409
+          return { error: 'Cannot clear chat history while a run is active' }
+        }
+        try {
+          // Storage re-checks activeRun under the same lock run acceptance
+          // uses, closing the snapshot-check/clear race.
+          await clearLibrarianChatHistory(dataDir, params.storyId)
+        } catch (err) {
+          if (err instanceof ChatHistoryConflictError) {
+            set.status = 409
+            return { error: err.message }
+          }
+          throw err
+        }
+        return { ok: true }
+      }, branchId)
     }, { detail: { summary: 'Clear chat history' } })
 
-    .post('/stories/:storyId/librarian/chat', async ({ params, body, set }) => {
+    .post('/stories/:storyId/librarian/chat', async ({ params, body, query, set }) => {
       const requestLogger = logger.child({ storyId: params.storyId })
       requestLogger.info('Librarian chat request', { messageCount: body.messages.length })
+
+      const branchId = await resolveBranchId(params.storyId, requestedBranchId(query))
+      if (!branchId) {
+        set.status = 404
+        return { error: 'Story not found' }
+      }
 
       const story = await getStory(dataDir, params.storyId)
       if (!story) {
@@ -388,43 +613,63 @@ export function librarianRoutes(dataDir: string) {
         return { error: 'At least one message is required' }
       }
 
-      let agent: ReturnType<typeof createAgentInstance> | undefined
-      try {
-        agent = createAgentInstance('librarian.chat', { dataDir, storyId: params.storyId })
-        const { eventStream, completion } = await agent.execute({
-          messages: body.messages,
-          maxSteps: story.settings.maxSteps ?? 10,
-        })
+      return withBranch(dataDir, params.storyId, async () => {
+        const snapshot = await getLibrarianChatSnapshot(dataDir, params.storyId, branchId, null)
+        if (snapshot.activeRun) {
+          set.status = 409
+          return { error: 'Cannot use the legacy streaming chat while a run is active' }
+        }
+        // A late legacy completion may only write if no newer turn committed.
+        const legacyExpectedRevision = snapshot.revision
 
-        // Persist chat history after completion (in background)
-        completion.then(async (result) => {
-          requestLogger.info('Librarian chat completed', {
-            stepCount: result.stepCount,
-            finishReason: result.finishReason,
-            toolCallCount: result.toolCalls.length,
+        let agent: ReturnType<typeof createAgentInstance> | undefined
+        try {
+          agent = createAgentInstance('librarian.chat', { dataDir, storyId: params.storyId })
+          const { eventStream, completion } = await agent.execute({
+            messages: body.messages,
+            maxSteps: story.settings.maxSteps ?? 10,
           })
-          const fullHistory = [
-            ...body.messages,
-            {
-              role: 'assistant' as const,
-              content: result.text,
-              ...(result.reasoning ? { reasoning: result.reasoning } : {}),
-            },
-          ]
-          await saveLibrarianChatHistory(dataDir, params.storyId, fullHistory)
-        }).catch((err) => {
-          requestLogger.error('Librarian chat completion error', { error: err instanceof Error ? err.message : String(err) })
-        })
 
-        return new Response(encodeStream(eventStream), {
-          headers: { 'Content-Type': 'application/x-ndjson; charset=utf-8' },
-        })
-      } catch (err) {
-        agent?.fail(err)
-        requestLogger.error('Librarian chat failed', { error: err instanceof Error ? err.message : String(err) })
-        set.status = 500
-        return { error: err instanceof Error ? err.message : 'Chat failed' }
-      }
+          // Persist chat history after completion (in background)
+          completion.then(async (result) => {
+            requestLogger.info('Librarian chat completed', {
+              stepCount: result.stepCount,
+              finishReason: result.finishReason,
+              toolCallCount: result.toolCalls.length,
+            })
+            const fullHistory = [
+              ...body.messages,
+              {
+                role: 'assistant' as const,
+                content: result.text,
+                ...(result.reasoning ? { reasoning: result.reasoning } : {}),
+              },
+            ]
+            const saved = await withBranch(
+              dataDir,
+              params.storyId,
+              () => saveLibrarianChatHistory(dataDir, params.storyId, fullHistory, {
+                expectedRevision: legacyExpectedRevision,
+              }),
+              branchId,
+            )
+            if (!saved) {
+              requestLogger.warn('Discarded stale legacy librarian chat completion')
+            }
+          }).catch((err) => {
+            requestLogger.error('Librarian chat completion error', { error: err instanceof Error ? err.message : String(err) })
+          })
+
+          return new Response(encodeStream(eventStream), {
+            headers: { 'Content-Type': 'application/x-ndjson; charset=utf-8' },
+          })
+        } catch (err) {
+          agent?.fail(err)
+          requestLogger.error('Librarian chat failed', { error: err instanceof Error ? err.message : String(err) })
+          set.status = 500
+          return { error: err instanceof Error ? err.message : 'Chat failed' }
+        }
+      }, branchId)
     }, {
       body: t.Object({
         messages: t.Array(t.Object({
@@ -436,71 +681,159 @@ export function librarianRoutes(dataDir: string) {
     })
 
     // --- Conversations ---
-    .get('/stories/:storyId/librarian/conversations', async ({ params }) => {
-      return listConversations(dataDir, params.storyId)
+    .get('/stories/:storyId/librarian/conversations', async ({ params, query, set }) => {
+      const branchId = await resolveBranchId(params.storyId, requestedBranchId(query))
+      if (!branchId) {
+        set.status = 404
+        return { error: 'Story or branch not found' }
+      }
+      return withBranch(dataDir, params.storyId, () => listConversations(dataDir, params.storyId), branchId)
     }, { detail: { summary: 'List chat conversations' } })
 
-    .post('/stories/:storyId/librarian/conversations', async ({ params, body }) => {
-      return createConversation(dataDir, params.storyId, body.title ?? 'New chat')
+    .post('/stories/:storyId/librarian/conversations', async ({ params, body, query, set }) => {
+      const branchId = await resolveBranchId(params.storyId, requestedBranchId(query))
+      if (!branchId) {
+        set.status = 404
+        return { error: 'Story or branch not found' }
+      }
+      return withBranch(
+        dataDir,
+        params.storyId,
+        () => createConversation(dataDir, params.storyId, body.title ?? 'New chat'),
+        branchId,
+      )
     }, {
       body: t.Object({ title: t.Optional(t.String()) }),
       detail: { summary: 'Create a chat conversation' },
     })
 
-    .delete('/stories/:storyId/librarian/conversations/:conversationId', async ({ params, set }) => {
-      const ok = await deleteConversation(dataDir, params.storyId, params.conversationId)
-      if (!ok) { set.status = 404; return { error: 'Conversation not found' } }
-      return { ok: true }
+    .delete('/stories/:storyId/librarian/conversations/:conversationId', async ({ params, query, set }) => {
+      const branchId = await resolveBranchId(params.storyId, requestedBranchId(query))
+      if (!branchId) {
+        set.status = 404
+        return { error: 'Story or branch not found' }
+      }
+      return withBranch(dataDir, params.storyId, async () => {
+        if (!(await conversationExists(dataDir, params.storyId, params.conversationId))) {
+          set.status = 404
+          return { error: 'Conversation not found' }
+        }
+        const snapshot = await getLibrarianChatSnapshot(
+          dataDir,
+          params.storyId,
+          branchId,
+          params.conversationId,
+        )
+        if (snapshot.activeRun) {
+          set.status = 409
+          return { error: 'Cannot delete a conversation while a run is active' }
+        }
+        try {
+          // Storage re-checks activeRun under the acceptance lock so a run
+          // accepted after the snapshot above cannot be deleted mid-flight.
+          const ok = await deleteConversation(dataDir, params.storyId, params.conversationId)
+          if (!ok) { set.status = 404; return { error: 'Conversation not found' } }
+          return { ok: true }
+        } catch (err) {
+          if (err instanceof ChatHistoryConflictError) {
+            set.status = 409
+            return { error: err.message }
+          }
+          throw err
+        }
+      }, branchId)
     }, { detail: { summary: 'Delete a conversation' } })
 
-    .get('/stories/:storyId/librarian/conversations/:conversationId/chat', async ({ params }) => {
-      return getConversationHistory(dataDir, params.storyId, params.conversationId)
+    .get('/stories/:storyId/librarian/conversations/:conversationId/chat', async ({ params, query, set }) => {
+      const branchId = await resolveBranchId(params.storyId, requestedBranchId(query))
+      if (!branchId) {
+        set.status = 404
+        return { error: 'Story or branch not found' }
+      }
+      return withBranch(dataDir, params.storyId, async () => {
+        if (!(await conversationExists(dataDir, params.storyId, params.conversationId))) {
+          set.status = 404
+          return { error: 'Conversation not found' }
+        }
+        return getConversationHistory(dataDir, params.storyId, params.conversationId)
+      }, branchId)
     }, { detail: { summary: 'Get conversation chat history' } })
 
-    .post('/stories/:storyId/librarian/conversations/:conversationId/chat', async ({ params, body, set }) => {
+    .post('/stories/:storyId/librarian/conversations/:conversationId/chat', async ({ params, body, query, set }) => {
       const requestLogger = logger.child({ storyId: params.storyId, extra: { conversationId: params.conversationId } })
       requestLogger.info('Conversation chat request', { messageCount: body.messages.length })
+
+      const branchId = await resolveBranchId(params.storyId, requestedBranchId(query))
+      if (!branchId) { set.status = 404; return { error: 'Story not found' } }
 
       const story = await getStory(dataDir, params.storyId)
       if (!story) { set.status = 404; return { error: 'Story not found' } }
       if (!body.messages.length) { set.status = 422; return { error: 'At least one message is required' } }
 
-      let agent: ReturnType<typeof createAgentInstance> | undefined
-      try {
-        agent = createAgentInstance('librarian.chat', { dataDir, storyId: params.storyId })
-        const { eventStream, completion } = await agent.execute({
-          messages: body.messages,
-          maxSteps: story.settings.maxSteps ?? 10,
-        })
+      return withBranch(dataDir, params.storyId, async () => {
+        if (!(await conversationExists(dataDir, params.storyId, params.conversationId))) {
+          set.status = 404
+          return { error: 'Conversation not found' }
+        }
+        const snapshot = await getLibrarianChatSnapshot(
+          dataDir,
+          params.storyId,
+          branchId,
+          params.conversationId,
+        )
+        if (snapshot.activeRun) {
+          set.status = 409
+          return { error: 'Cannot use the legacy streaming chat while a run is active' }
+        }
+        const legacyExpectedRevision = snapshot.revision
 
-        completion.then(async (result) => {
-          requestLogger.info('Conversation chat completed', {
-            stepCount: result.stepCount,
-            finishReason: result.finishReason,
-            toolCallCount: result.toolCalls.length,
+        let agent: ReturnType<typeof createAgentInstance> | undefined
+        try {
+          agent = createAgentInstance('librarian.chat', { dataDir, storyId: params.storyId })
+          const { eventStream, completion } = await agent.execute({
+            messages: body.messages,
+            maxSteps: story.settings.maxSteps ?? 10,
           })
-          const fullHistory = [
-            ...body.messages,
-            {
-              role: 'assistant' as const,
-              content: result.text,
-              ...(result.reasoning ? { reasoning: result.reasoning } : {}),
-            },
-          ]
-          await saveConversationHistory(dataDir, params.storyId, params.conversationId, fullHistory)
-        }).catch((err) => {
-          requestLogger.error('Conversation chat completion error', { error: err instanceof Error ? err.message : String(err) })
-        })
 
-        return new Response(encodeStream(eventStream), {
-          headers: { 'Content-Type': 'application/x-ndjson; charset=utf-8' },
-        })
-      } catch (err) {
-        agent?.fail(err)
-        requestLogger.error('Conversation chat failed', { error: err instanceof Error ? err.message : String(err) })
-        set.status = 500
-        return { error: err instanceof Error ? err.message : 'Chat failed' }
-      }
+          completion.then(async (result) => {
+            requestLogger.info('Conversation chat completed', {
+              stepCount: result.stepCount,
+              finishReason: result.finishReason,
+              toolCallCount: result.toolCalls.length,
+            })
+            const fullHistory = [
+              ...body.messages,
+              {
+                role: 'assistant' as const,
+                content: result.text,
+                ...(result.reasoning ? { reasoning: result.reasoning } : {}),
+              },
+            ]
+            const saved = await withBranch(
+              dataDir,
+              params.storyId,
+              () => saveConversationHistory(dataDir, params.storyId, params.conversationId, fullHistory, {
+                expectedRevision: legacyExpectedRevision,
+              }),
+              branchId,
+            )
+            if (!saved) {
+              requestLogger.warn('Discarded stale legacy conversation completion')
+            }
+          }).catch((err) => {
+            requestLogger.error('Conversation chat completion error', { error: err instanceof Error ? err.message : String(err) })
+          })
+
+          return new Response(encodeStream(eventStream), {
+            headers: { 'Content-Type': 'application/x-ndjson; charset=utf-8' },
+          })
+        } catch (err) {
+          agent?.fail(err)
+          requestLogger.error('Conversation chat failed', { error: err instanceof Error ? err.message : String(err) })
+          set.status = 500
+          return { error: err instanceof Error ? err.message : 'Chat failed' }
+        }
+      }, branchId)
     }, {
       body: t.Object({
         messages: t.Array(t.Object({

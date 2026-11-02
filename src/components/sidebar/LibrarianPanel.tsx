@@ -38,6 +38,7 @@ import {
 import { EmptyState } from '@/components/ui/async-view'
 import { RefinementPanel } from '@/components/refinement/RefinementPanel'
 import { LibrarianChat } from '@/components/librarian/LibrarianChat'
+import { componentId } from '@/lib/dom-ids'
 
 interface LibrarianPanelProps {
   storyId: string
@@ -48,47 +49,83 @@ interface LibrarianPanelProps {
 
 type TabValue = 'chat' | 'story' | 'summaries'
 
-function tabStorageKey(storyId: string): string {
-  return `errata.librarian.activeTab.${storyId}`
+function tabStorageKey(storyId: string, branchId: string): string {
+  return `errata.librarian.activeTab.${JSON.stringify([storyId, branchId])}`
 }
 
-function readSavedTab(storyId: string): TabValue {
+function readSavedTab(storyId: string, branchId: string): TabValue {
   if (typeof window === 'undefined') return 'chat'
-  const saved = window.localStorage.getItem(tabStorageKey(storyId))
-  if (saved === 'story' || saved === 'summaries') return saved
+  try {
+    const saved = window.localStorage.getItem(tabStorageKey(storyId, branchId))
+    if (saved === 'story' || saved === 'summaries') return saved
+  } catch { /* Browser storage is optional for panel preferences. */ }
   return 'chat'
 }
 
-export function LibrarianPanel({ storyId, askFragmentId, askPrefill, onAskFragmentConsumed }: LibrarianPanelProps) {
-  const [activeTab, setActiveTab] = useState<TabValue>(() => readSavedTab(storyId))
+function conversationStorageKey(storyId: string, branchId: string): string {
+  return `errata.librarian.selectedConversation.${JSON.stringify([storyId, branchId])}`
+}
+
+function readSavedConversation(storyId: string, branchId: string): string | null {
+  try { return window.localStorage.getItem(conversationStorageKey(storyId, branchId)) } catch { return null }
+}
+
+export function LibrarianPanel(props: LibrarianPanelProps) {
+  const { data: branches, error } = useQuery({
+    queryKey: ['branches', props.storyId],
+    queryFn: () => api.branches.list(props.storyId),
+  })
+  if (!branches) return (
+    <div className="p-3 text-xs text-muted-foreground" data-component-id="librarian-panel-root" role="status">
+      {error ? 'Could not load the current timeline.' : 'Loading librarian…'}
+    </div>
+  )
+  return <ScopedLibrarianPanel key={JSON.stringify([props.storyId, branches.activeBranchId])} {...props} branchId={branches.activeBranchId} />
+}
+
+function ScopedLibrarianPanel({ storyId, branchId, askFragmentId, askPrefill, onAskFragmentConsumed }: LibrarianPanelProps & { branchId: string }) {
+  const [activeTab, setActiveTab] = useState<TabValue>(() => readSavedTab(storyId, branchId))
   const [chatInitialInput, setChatInitialInput] = useState<string>('')
-  const [activeConversationId, setActiveConversationId] = useState<string | null>(null)
+  const [activeConversationId, setConversationId] = useState<string | null>(() => readSavedConversation(storyId, branchId))
+  const setActiveConversationId = (id: string | null) => {
+    setConversationId(id)
+    try {
+      const key = conversationStorageKey(storyId, branchId)
+      if (id) window.localStorage.setItem(key, id)
+      else window.localStorage.removeItem(key)
+    } catch { /* Selection persistence is optional; chat request persistence is not. */ }
+  }
   const queryClient = useQueryClient()
+  const conversationsKey = ['librarian-conversations', storyId, branchId]
 
   // Fetch conversation list
-  const { data: conversations } = useQuery({
-    queryKey: ['librarian-conversations', storyId],
-    queryFn: () => api.librarian.listConversations(storyId),
+  const { data: conversations, isFetching: fetchingConversations } = useQuery({
+    queryKey: conversationsKey,
+    queryFn: () => api.librarian.listConversations(storyId, branchId),
   })
 
   const createConversationMutation = useMutation({
-    mutationFn: (title: string | undefined) => api.librarian.createConversation(storyId, title),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['librarian-conversations', storyId] })
+    mutationFn: (title: string | undefined) => api.librarian.createConversation(storyId, title, branchId),
+    onSuccess: (conversation) => {
+      queryClient.setQueryData<ConversationMeta[]>(conversationsKey, old => [...(old ?? []).filter(c => c.id !== conversation.id), conversation])
+      queryClient.invalidateQueries({ queryKey: conversationsKey })
     },
   })
 
   const deleteConversationMutation = useMutation({
-    mutationFn: (conversationId: string) => api.librarian.deleteConversation(storyId, conversationId),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['librarian-conversations', storyId] })
+    mutationFn: (conversationId: string) => api.librarian.deleteConversation(storyId, conversationId, branchId),
+    onSuccess: (_result, id) => {
+      queryClient.setQueryData<ConversationMeta[]>(conversationsKey, old => old?.filter(c => c.id !== id) ?? [])
+      queryClient.invalidateQueries({ queryKey: conversationsKey })
     },
   })
 
   useEffect(() => {
-    setActiveTab(readSavedTab(storyId))
-    setActiveConversationId(null)
-  }, [storyId])
+    if (!fetchingConversations && conversations && activeConversationId && !conversations.some(c => c.id === activeConversationId)) {
+      setActiveConversationId(null)
+      setChatInitialInput('')
+    }
+  }, [conversations, fetchingConversations, activeConversationId])
 
   // Handle ask librarian from prose action panel — always create a new conversation
   useEffect(() => {
@@ -106,8 +143,8 @@ export function LibrarianPanel({ storyId, askFragmentId, askPrefill, onAskFragme
 
   useEffect(() => {
     if (typeof window === 'undefined') return
-    window.localStorage.setItem(tabStorageKey(storyId), activeTab)
-  }, [activeTab, storyId])
+    try { window.localStorage.setItem(tabStorageKey(storyId, branchId), activeTab) } catch { /* Optional preference. */ }
+  }, [activeTab, storyId, branchId])
 
   const { data: status } = useQuery({
     queryKey: ['librarian-status', storyId],
@@ -140,6 +177,12 @@ export function LibrarianPanel({ storyId, askFragmentId, askPrefill, onAskFragme
         </TabsList>
       </div>
 
+      {(deleteConversationMutation.error || createConversationMutation.error) && (
+        <p role="alert" className="mx-3 my-1.5 text-xs text-destructive" data-component-id="librarian-conversation-error">
+          {(deleteConversationMutation.error || createConversationMutation.error)?.message}
+        </p>
+      )}
+
       {/* Tab content */}
       <TabsContent value="chat" className="flex-1 min-h-0 mt-0">
         {activeConversationId ? (
@@ -169,7 +212,7 @@ export function LibrarianPanel({ storyId, askFragmentId, askPrefill, onAskFragme
               </button>
             </div>
             <div className="flex-1 min-h-0">
-              <LibrarianChat storyId={storyId} conversationId={activeConversationId} initialInput={chatInitialInput} />
+              <LibrarianChat storyId={storyId} branchId={branchId} conversationId={activeConversationId} initialInput={chatInitialInput} />
             </div>
           </div>
         ) : (
@@ -177,9 +220,11 @@ export function LibrarianPanel({ storyId, askFragmentId, askPrefill, onAskFragme
             conversations={conversations ?? []}
             onSelect={(id) => { setActiveConversationId(id); setChatInitialInput('') }}
             onNew={async () => {
-              const conv = await createConversationMutation.mutateAsync(undefined)
-              setActiveConversationId(conv.id)
-              setChatInitialInput('')
+              try {
+                const conv = await createConversationMutation.mutateAsync(undefined)
+                setActiveConversationId(conv.id)
+                setChatInitialInput('')
+              } catch { /* The mutation error is shown above the list. */ }
             }}
             onDelete={(id) => deleteConversationMutation.mutate(id)}
           />
@@ -255,12 +300,13 @@ function ConversationList({ conversations, onSelect, onNew, onDelete }: Conversa
             const timeStr = formatRelativeTime(date)
 
             return (
-              <button
+              <div
                 key={conv.id}
-                onClick={() => onSelect(conv.id)}
-                className="group w-full text-left rounded-md px-2.5 py-2 hover:bg-muted/50 transition-colors"
+                data-component-id={componentId('librarian-conversation', conv.id)}
+                className="group relative w-full rounded-md hover:bg-muted/50 transition-colors"
               >
-                <div className="flex items-start gap-2">
+                <button type="button" onClick={() => onSelect(conv.id)} className="w-full text-left px-2.5 py-2 pr-8 rounded-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40">
+                  <div className="flex items-start gap-2">
                   <MessageSquare className="size-3 text-muted-foreground/50 mt-0.5 shrink-0" />
                   <div className="flex-1 min-w-0">
                     <div className="text-[0.6875rem] text-foreground/80 truncate leading-tight">
@@ -270,15 +316,17 @@ function ConversationList({ conversations, onSelect, onNew, onDelete }: Conversa
                       {timeStr}
                     </div>
                   </div>
+                  </div>
+                </button>
                   <button
                     onClick={(e) => { e.stopPropagation(); onDelete(conv.id) }}
-                    className="opacity-0 group-hover:opacity-100 text-muted-foreground/40 hover:text-destructive transition-all p-0.5 rounded shrink-0"
+                    className="absolute right-2 top-2 opacity-0 group-hover:opacity-100 focus-visible:opacity-100 text-muted-foreground/40 hover:text-destructive transition-all p-0.5 rounded shrink-0"
                     title="Delete conversation"
+                    aria-label={`Delete conversation: ${conv.title}`}
                   >
                     <Trash2 className="size-3" />
                   </button>
-                </div>
-              </button>
+              </div>
             )
           })}
         </div>
@@ -1366,4 +1414,3 @@ function FullscreenSummaryEditor({
     document.body,
   )
 }
-

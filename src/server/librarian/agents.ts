@@ -43,6 +43,12 @@ const ChatInputSchema = z.object({
     content: z.string(),
   })),
   maxSteps: z.int().positive().optional(),
+  /**
+   * Internal lifecycle signal used by the server-owned chat-run manager.
+   * Not part of the public HTTP contract; it is accepted here so the agent
+   * wrapper's input parsing does not strip it before `librarianChat` runs.
+   */
+  signal: z.custom<AbortSignal>().optional(),
 })
 
 const OptimizeCharacterInputSchema = z.object({

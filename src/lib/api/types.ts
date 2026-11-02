@@ -236,6 +236,8 @@ export interface LibrarianAcceptSuggestionResponse {
   createdFragmentId: string | null
 }
 
+export type { LibrarianChatStatus, LibrarianChatMessage, LibrarianChatSnapshot, LibrarianChatStartInput } from '@/lib/librarian-chat'
+
 export interface ChatHistory {
   messages: Array<{ role: 'user' | 'assistant'; content: string; reasoning?: string }>
   updatedAt: string

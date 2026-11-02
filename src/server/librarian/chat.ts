@@ -30,6 +30,11 @@ export interface ChatMessage {
 export interface ChatOptions {
   messages: ChatMessage[]
   maxSteps?: number
+  /**
+   * Internal lifecycle signal. The server-owned chat-run manager aborts this
+   * only on an explicit cancel request; HTTP disconnects never cancel a run.
+   */
+  signal?: AbortSignal
 }
 
 export async function librarianChat(
@@ -224,10 +229,15 @@ async function librarianChatInner(
     })),
   ]
 
-  // Stream with write tools
+  // Stream with write tools. The lifecycle signal is owned by the server-side
+  // run manager, not by an HTTP request/response pair.
   const result = await chatAgent.stream({
     messages: aiMessages,
+    abortSignal: opts.signal,
   })
 
+  // Do not wire the returned stream's cancel hook to the AbortSignal here:
+  // dropping a poller must never stop the provider call. Explicit cancel is
+  // delivered through `opts.signal` above.
   return createEventStream(result.fullStream)
 }

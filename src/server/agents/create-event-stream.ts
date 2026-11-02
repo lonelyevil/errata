@@ -2,7 +2,9 @@ import type { AgentStreamEvent, AgentStreamCompletion, AgentStreamResult } from 
 
 /**
  * Converts an AI SDK v6 fullStream into an NDJSON event stream + completion promise.
- * Handles: text-delta, reasoning-delta, tool-call, tool-result, finish-step, finish.
+ * Handles: text-delta, reasoning-delta, tool-call, tool-result, finish-step,
+ * finish, and provider `error` chunks (which fail both the stream and the
+ * completion instead of looking like a successful empty response).
  *
  * @param onCancel - invoked when the returned stream is cancelled (client
  *   disconnect). Wire this to an AbortController so the underlying LLM call
@@ -80,6 +82,15 @@ export function createEventStream(
             case 'finish':
               lastFinishReason = (p.finishReason as string) ?? 'unknown'
               break
+            case 'error': {
+              // AI SDK v6 reports provider failures as a stream part. Throwing
+              // here routes it through the same error path as an iterator
+              // rejection; otherwise consumers see a normal finish with no text.
+              const error = p.error
+              throw error instanceof Error
+                ? error
+                : new Error(typeof error === 'string' ? error : 'Model stream error')
+            }
           }
 
           if (event) {
