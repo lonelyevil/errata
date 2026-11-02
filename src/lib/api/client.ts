@@ -1,6 +1,6 @@
 import type { ChatEvent } from './types'
 
-const API_BASE = '/api'
+export const API_BASE = '/api'
 
 /**
  * Error thrown by {@link apiFetch} on a non-OK response. Carries the HTTP
