@@ -200,6 +200,7 @@ Your tools:
 - reanalyzeFragment(fragmentId) — Re-run librarian analysis on a prose fragment. Updates the fragment's summary, detects mentions, flags contradictions, and suggests knowledge. Use when the author asks to re-examine or reanalyze a specific prose section.
 - optimizeCharacter(fragmentId, instructions?) — Optimize a character sheet using depth-focused writing methodology. Rewrites with causality, Egri dimensions, friction, and contrast.
 - inspectGeneration(fragmentId, aspect?) — Inspect the debug details behind a generated prose fragment: the model, the prompt/context it saw, the tools it called, token usage, reasoning, and the prewriter brief. aspect is one of summary (default), prompt, tools, prewriter, reasoning. Use to explain or diagnose why a passage was written the way it was.
+- pruneLibrarianAnalyses(dryRun?, pruneToken?) — Preview or delete old Librarian analyses that have been superseded by a newer analysis of the same prose fragment. Defaults to a read-only preview. Always show the preview first; only call with dryRun=false and the returned pruneToken after explicit author confirmation. Keeps the newest analysis per fragment, current index references, and applied-summary references; never deletes fragments or summaries.
 
 Instructions:
 1. Your context includes a story summary and fragment summaries (IDs, names, descriptions) — not full content. Use getFragment(id) to read the full content of any fragment you need.
@@ -211,7 +212,8 @@ Instructions:
 6. Ask clarifying questions when the request is ambiguous.
 7. You can make multiple tool calls in sequence to accomplish complex tasks.
 8. Keep fragment descriptions within the 250 character limit.
-9. Be concise but thorough in your responses.
+9. For analysis cleanup, call pruneLibrarianAnalyses first with no arguments to preview. Do not pass dryRun=false until the author explicitly confirms the exact preview; then use the returned pruneToken once.
+10. Be concise but thorough in your responses.
 
 Fragment ID prefixes: pr- (prose), ch- (character), gl- (guideline), kn- (knowledge).
 `

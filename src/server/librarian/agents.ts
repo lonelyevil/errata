@@ -159,6 +159,7 @@ export function registerLibrarianAgents(): void {
       'getFragment', 'listFragments', 'searchFragments', 'listFragmentTypes',
       'createFragment', 'updateFragment', 'editFragment', 'deleteFragment',
       'editProse', 'getStorySummary', 'updateStorySummary', 'reanalyzeFragment', 'optimizeCharacter',
+      'pruneLibrarianAnalyses',
     ],
     buildPreviewContext: buildChatPreviewContext,
   })

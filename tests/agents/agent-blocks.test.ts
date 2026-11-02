@@ -208,6 +208,11 @@ describe('Librarian Chat Blocks', () => {
     expect(ids).toContain('story-info')
   })
 
+  it('lists pruneLibrarianAnalyses in the chat available tools', () => {
+    const def = agentBlockRegistry.get('librarian.chat')!
+    expect(def.availableTools).toContain('pruneLibrarianAnalyses')
+  })
+
   it('includes plugin tool descriptions in instructions', () => {
     const def = agentBlockRegistry.get('librarian.chat')!
     const blocks = def.createDefaultBlocks(makeBaseContext({

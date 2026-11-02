@@ -338,6 +338,38 @@ describe('librarian chat endpoint', () => {
     expect(config.instructions).toContain('reanalyzeFragment')
   })
 
+  it('includes pruneLibrarianAnalyses and its safety instructions', async () => {
+    const story = makeStory()
+    await createStory(dataDir, story)
+
+    mockAgentStream.mockResolvedValue({
+      fullStream: createMockFullStream([{ type: 'finish', finishReason: 'stop', stepCount: 1 }]),
+      text: Promise.resolve(''),
+      reasoning: Promise.resolve(''),
+      toolCalls: Promise.resolve([]),
+      finishReason: Promise.resolve('stop'),
+      steps: Promise.resolve([]),
+    })
+
+    await app.fetch(
+      new Request(`http://localhost/api/stories/${story.id}/librarian/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          messages: [{ role: 'user', content: 'Clean up old analyses' }],
+        }),
+      }),
+    )
+
+    expect(mockAgentCtor).toHaveBeenCalled()
+    const config = mockAgentCtor.mock.calls[0][0]
+    expect(config.tools.pruneLibrarianAnalyses).toBeDefined()
+    expect(config.instructions).toContain('pruneLibrarianAnalyses')
+    expect(config.instructions).toContain('dryRun=false')
+    expect(config.instructions).toContain('pruneToken')
+    expect(config.instructions).toContain('explicit')
+  })
+
   it('includes conversation history in messages', async () => {
     const story = makeStory()
     await createStory(dataDir, story)

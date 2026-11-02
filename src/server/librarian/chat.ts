@@ -13,6 +13,7 @@ import { createAgentInstance } from '../agents/agent-instance'
 import { getFragmentsByTag } from '../fragments/associations'
 import { inspectGenerationForFragment, type InspectAspect } from './inspect-generation'
 import { runLibrarian } from './agent'
+import { pruneAnalyses } from './analysis-pruner'
 import { withBranch } from '../fragments/branches'
 import type { ChatStreamEvent, ChatResult } from '../agents/stream-types'
 import type { AgentBlockContext } from '../agents/agent-block-context'
@@ -140,7 +141,35 @@ async function librarianChatInner(
     },
   })
 
-  const allTools = { ...fragmentTools, ...pluginTools, reanalyzeFragment: reanalyzeFragmentTool, optimizeCharacter: optimizeCharacterTool, inspectGeneration: inspectGenerationTool }
+  const pruneLibrarianAnalysesTool = tool({
+    description:
+      'Clean up old Librarian analysis records for this story. The default is a read-only preview. Keeps the newest analysis for each fragmentId, current index entries, and applied-summary references. Never deletes fragments or summaries. To execute, first preview and then call again with dryRun=false and the returned pruneToken only after explicit user confirmation.',
+    inputSchema: z.object({
+      dryRun: z
+        .boolean()
+        .optional()
+        .describe('Defaults to true. False permanently deletes the previewed superseded analyses.'),
+      pruneToken: z
+        .string()
+        .optional()
+        .describe('Unexpired, unused token returned by the matching preview.'),
+    }),
+    execute: async (input: { dryRun?: boolean; pruneToken?: string }) => {
+      requestLogger.info('Pruning librarian analyses via chat tool', {
+        dryRun: input.dryRun !== false,
+      })
+      return pruneAnalyses(dataDir, storyId, input)
+    },
+  })
+
+  const allTools = {
+    ...fragmentTools,
+    ...pluginTools,
+    reanalyzeFragment: reanalyzeFragmentTool,
+    optimizeCharacter: optimizeCharacterTool,
+    inspectGeneration: inspectGenerationTool,
+    pruneLibrarianAnalyses: pruneLibrarianAnalysesTool,
+  }
 
   // Build plugin tool descriptions for the block context
   const pluginToolDescriptions = Object.entries(pluginTools).map(([name, def]) => ({

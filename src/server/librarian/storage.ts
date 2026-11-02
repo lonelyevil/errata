@@ -1,14 +1,48 @@
 import { mkdir, readdir, readFile, unlink } from 'node:fs/promises'
 import { join } from 'node:path'
 import { existsSync } from 'node:fs'
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { getContentRoot } from '../fragments/branches'
 import { generateConversationId } from '@/lib/fragment-ids'
 import { writeJsonAtomic } from '../fs-utils'
 import { withKeyLock } from '../async-lock'
 
+/**
+ * Tracks index-lock depth by key for the current async chain. Nested storage
+ * calls (saveAnalysis -> delete -> rebuild, or a plugin prune) must not
+ * self-deadlock on the non-reentrant withKeyLock, but concurrent siblings
+ * spawned inside the same context must still serialize with each other.
+ */
+const heldIndexLocks = new AsyncLocalStorage<Map<string, number>>()
+
+/**
+ * Serializes analysis file/index mutations for a story. Exported so server
+ * plugins that need to read, delete, and rebuild in one critical section can
+ * share the same lock as saveAnalysis.
+ */
+export function withAnalysisLock<T>(
+  dataDir: string,
+  storyId: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  return withIndexLock(dataDir, storyId, fn)
+}
+
 /** Serializes read-modify-write of a story's analysis index against concurrent saves. */
-function withIndexLock<T>(storyId: string, fn: () => Promise<T>): Promise<T> {
-  return withKeyLock(`librarian-index:${storyId}`, fn)
+function withIndexLock<T>(dataDir: string, storyId: string, fn: () => Promise<T>): Promise<T> {
+  const key = `librarian-index:${dataDir}:${storyId}`
+  const held = heldIndexLocks.getStore()
+  const depth = held?.get(key) ?? 0
+  // Outer calls use `key`; nested calls use a depth-specific key so parallel
+  // nested operations can't bypass the outer lock, while sequential nesting
+  // remains reentrant.
+  const lockKey = depth === 0 ? key : `${key}::${depth}`
+
+  return withKeyLock(lockKey, () => {
+    const next = new Map(held ?? [])
+    next.set(key, depth + 1)
+    return heldIndexLocks.run(next, fn)
+  })
 }
 
 // --- Types ---
@@ -213,15 +247,22 @@ export async function rebuildAnalysisIndex(
   dataDir: string,
   storyId: string,
 ): Promise<LibrarianAnalysisIndex> {
-  const summaries = await listAnalyses(dataDir, storyId)
-  const latest = selectLatestAnalysesByFragment(summaries)
-  const rebuilt: LibrarianAnalysisIndex = defaultAnalysisIndex()
-  for (const [fragmentId, summary] of latest.entries()) {
-    rebuilt.latestByFragmentId[fragmentId] = analysisSummaryToIndexEntry(summary)
-  }
-  rebuilt.updatedAt = new Date().toISOString()
-  await saveAnalysisIndex(dataDir, storyId, rebuilt)
-  return rebuilt
+  return withIndexLock(dataDir, storyId, async () => {
+    const existing = await getAnalysisIndex(dataDir, storyId)
+    const summaries = await listAnalyses(dataDir, storyId)
+    const latest = selectLatestAnalysesByFragment(summaries)
+    const rebuilt: LibrarianAnalysisIndex = defaultAnalysisIndex()
+    for (const [fragmentId, summary] of latest.entries()) {
+      rebuilt.latestByFragmentId[fragmentId] = analysisSummaryToIndexEntry(summary)
+    }
+    // Rebuilding must not discard metadata owned by other librarian flows.
+    if (existing?.appliedSummarySequence) {
+      rebuilt.appliedSummarySequence = existing.appliedSummarySequence
+    }
+    rebuilt.updatedAt = new Date().toISOString()
+    await saveAnalysisIndex(dataDir, storyId, rebuilt)
+    return rebuilt
+  })
 }
 
 export async function clearAnalysisIndexEntry(
@@ -229,7 +270,7 @@ export async function clearAnalysisIndexEntry(
   storyId: string,
   fragmentId: string,
 ): Promise<void> {
-  await withIndexLock(storyId, async () => {
+  await withIndexLock(dataDir, storyId, async () => {
     const index = await getAnalysisIndex(dataDir, storyId)
     if (!index) return
     if (!(fragmentId in index.latestByFragmentId)) return
@@ -257,16 +298,20 @@ export async function saveAnalysis(
   storyId: string,
   analysis: LibrarianAnalysis,
 ): Promise<void> {
-  const dir = await analysesDir(dataDir, storyId)
-  await mkdir(dir, { recursive: true })
-  await writeJsonAtomic(
-    await analysisPath(dataDir, storyId, analysis.id),
-    analysis,
-  )
+  // The analysis file and its index update form one critical section: a prune
+  // must never observe a saved file that is not yet reflected in the index (or
+  // vice versa). This is safe to nest because withIndexLock is reentrant for
+  // the current async chain.
+  await withIndexLock(dataDir, storyId, async () => {
+    const dir = await analysesDir(dataDir, storyId)
+    await mkdir(dir, { recursive: true })
+    await writeJsonAtomic(
+      await analysisPath(dataDir, storyId, analysis.id),
+      analysis,
+    )
 
-  // Index read-modify-write must be serialized: concurrent saves would each read
-  // the same index and the later write would drop the earlier entry.
-  await withIndexLock(storyId, async () => {
+    // Index read-modify-write must be serialized: concurrent saves would each
+    // read the same index and the later write would drop the earlier entry.
     const currentIndex = await getAnalysisIndex(dataDir, storyId) ?? defaultAnalysisIndex()
     const previous = currentIndex.latestByFragmentId[analysis.fragmentId]
     if (shouldReplaceIndexEntry(previous, { createdAt: analysis.createdAt, analysisId: analysis.id })) {
@@ -308,17 +353,17 @@ export async function deleteAnalysis(
   storyId: string,
   analysisId: string,
 ): Promise<boolean> {
-  const path = await analysisPath(dataDir, storyId, analysisId)
-  if (!existsSync(path)) return false
+  return withIndexLock(dataDir, storyId, async () => {
+    const path = await analysisPath(dataDir, storyId, analysisId)
+    if (!existsSync(path)) return false
 
-  // Read the analysis to get fragmentId for index cleanup
-  const raw = await readFile(path, 'utf-8')
-  const analysis = normalizeAnalysis(JSON.parse(raw))
+    // Read the analysis to get fragmentId for index cleanup
+    const raw = await readFile(path, 'utf-8')
+    const analysis = normalizeAnalysis(JSON.parse(raw))
 
-  await unlink(path)
+    await unlink(path)
 
-  // Clean up index entry if it points to this analysis
-  await withIndexLock(storyId, async () => {
+    // Clean up index entry if it points to this analysis
     const index = await getAnalysisIndex(dataDir, storyId)
     if (index) {
       const entry = index.latestByFragmentId[analysis.fragmentId]
@@ -328,9 +373,9 @@ export async function deleteAnalysis(
         await saveAnalysisIndex(dataDir, storyId, index)
       }
     }
-  })
 
-  return true
+    return true
+  })
 }
 
 export async function listAnalyses(
